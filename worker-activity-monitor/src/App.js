@@ -2,14 +2,59 @@ import React, { useState, useEffect } from 'react';
 import CameraFeed from './components/CameraFeed';
 import Analytics from './components/Analytics';
 import { saveAs } from 'file-saver';
+import Login from './components/Login';
+import Signup from './components/Signup';
+import authService from './services/authService';
 
 const App = () => {
+  // Authentication states
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [currentUser, setCurrentUser] = useState(null);
+  const [authView, setAuthView] = useState('login'); // 'login' or 'signup'
+
+  // Worker monitoring states
   const [activityData, setActivityData] = useState([]);
   const [uniqueWorkers, setUniqueWorkers] = useState({});
   const [resetWorkersFlag, setResetWorkersFlag] = useState(false);
-
   const [lastUpdateTime, setLastUpdateTime] = useState(null);
   const [dataCollectionRate, setDataCollectionRate] = useState('5s');
+
+  // Check for authentication on component mount
+  useEffect(() => {
+    // Check if user is already logged in
+    const user = authService.getCurrentUser();
+    if (user) {
+      setCurrentUser(user);
+      setIsAuthenticated(true);
+    }
+  }, []);
+
+  // Handle login success
+  const handleLogin = (user) => {
+    setCurrentUser(user);
+    setIsAuthenticated(true);
+  };
+
+  // Handle signup success
+  const handleSignup = (user) => {
+    handleLogin(user);
+  };
+
+  // Handle logout
+  const handleLogout = () => {
+    authService.logout();
+    setCurrentUser(null);
+    setIsAuthenticated(false);
+    // Reset application state
+    setActivityData([]);
+    setUniqueWorkers({});
+    setLastUpdateTime(null);
+  };
+
+  // Toggle between login and signup views
+  const toggleAuthView = () => {
+    setAuthView(authView === 'login' ? 'signup' : 'login');
+  };
 
   // Handle new activity data from CameraFeed
   const handleActivity = (statuses) => {
@@ -93,9 +138,56 @@ const App = () => {
     }
   };
 
+  // Show login/signup screens if not authenticated
+  if (!isAuthenticated) {
+    return (
+      <div className="min-h-screen bg-gray-100 flex flex-col items-center p-6">
+        <h1 className="text-3xl font-bold mb-6">Worker Activity Monitor</h1>
+        
+        {authView === 'login' ? (
+          <>
+            <Login onLogin={handleLogin} />
+            <div className="mt-4 text-center">
+              <p>Don't have an account? <button 
+                className="text-blue-600 underline" 
+                onClick={toggleAuthView}
+              >
+                Sign up
+              </button></p>
+            </div>
+          </>
+        ) : (
+          <>
+            <Signup onSignup={handleSignup} />
+            <div className="mt-4 text-center">
+              <p>Already have an account? <button 
+                className="text-blue-600 underline" 
+                onClick={toggleAuthView}
+              >
+                Log in
+              </button></p>
+            </div>
+          </>
+        )}
+      </div>
+    );
+  }
+
+  // Show main app if authenticated
   return (
     <div className="min-h-screen bg-gray-100 flex flex-col items-center p-6">
-      <h1 className="text-3xl font-bold mb-6">Worker Activity Monitor</h1>
+      <div className="w-full max-w-3xl flex justify-between items-center mb-6">
+        <h1 className="text-3xl font-bold">Worker Activity Monitor</h1>
+        <div className="flex items-center">
+          <span className="mr-4">Welcome, {currentUser.name || currentUser.email}</span>
+          <button
+            onClick={handleLogout}
+            className="px-4 py-2 bg-gray-600 text-white rounded hover:bg-gray-700"
+          >
+            Logout
+          </button>
+        </div>
+      </div>
       
       <div className="bg-white p-4 rounded-lg shadow-md mb-6 w-full max-w-2xl">
         <div className="mb-2 text-gray-700">

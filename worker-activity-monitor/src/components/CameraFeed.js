@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useMemo } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import * as poseDetection from '@tensorflow-models/pose-detection';
 import * as tf from '@tensorflow/tfjs';
 import '@tensorflow/tfjs-backend-webgl';
@@ -6,32 +6,19 @@ import '@tensorflow/tfjs-backend-webgl';
 const CameraFeed = ({ onActivity, resetWorkers }) => {
   const videoRef = useRef(null);
   const detectorRef = useRef(null);
-  const lastKeypointsRef = useRef({});
-  const nextPersonIdRef = useRef(1);
-  // Move lastPositionsRef to component level
-  const lastPositionsRef = useRef({});
+  const workerTrackingRef = useRef({});  // Track worker positions and movement
+  const nextWorkerIdRef = useRef(1);
   
   const [isModelLoaded, setIsModelLoaded] = useState(false);
-  const [workersStatus, setWorkersStatus] = useState([]);
-  const [detectedPeopleIds, setDetectedPeopleIds] = useState({});
+  const [workers, setWorkers] = useState([]);
+  const [cameraError, setCameraError] = useState(null);
 
-  // Reset worker IDs when resetWorkers changes
+  // Reset tracking when requested
   useEffect(() => {
     if (resetWorkers) {
-      // Reset the next person ID counter
-      nextPersonIdRef.current = 1;
-      
-      // Clear tracking of detected people
-      setDetectedPeopleIds({});
-      
-      // Clear last keypoints
-      lastKeypointsRef.current = {};
-      
-      // Clear worker status
-      setWorkersStatus([]);
-      
-      // Clear last positions
-      lastPositionsRef.current = {};
+      nextWorkerIdRef.current = 1;
+      workerTrackingRef.current = {};
+      setWorkers([]);
     }
   }, [resetWorkers]);
 
@@ -57,15 +44,15 @@ const CameraFeed = ({ onActivity, resetWorkers }) => {
         console.log("Pose detector ready");
       } catch (error) {
         console.error("Error initializing detector:", error);
+        setCameraError("Failed to initialize pose detector");
       }
     };
 
     initializeDetector();
     
-    // Cleanup function
     return () => {
+      // Cleanup
       if (detectorRef.current) {
-        // No explicit cleanup needed for MoveNet
         console.log("Cleaning up detector resources");
       }
     };
@@ -73,7 +60,6 @@ const CameraFeed = ({ onActivity, resetWorkers }) => {
 
   // Initialize camera
   useEffect(() => {
-    let videoElement = null;
     let stream = null;
     
     const setupCamera = async () => {
@@ -87,20 +73,20 @@ const CameraFeed = ({ onActivity, resetWorkers }) => {
           } 
         });
         
-        videoElement = videoRef.current;
-        if (videoElement) {
-          videoElement.srcObject = stream;
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
           console.log("Camera stream connected");
         }
       } catch (error) {
         console.error("Error accessing camera:", error);
+        setCameraError("Could not access camera. Please check permissions.");
       }
     };
 
     setupCamera();
     
-    // Cleanup function - store reference to current video element and stream
     return () => {
+      // Cleanup camera stream
       if (stream) {
         const tracks = stream.getTracks();
         tracks.forEach(track => track.stop());
@@ -109,181 +95,217 @@ const CameraFeed = ({ onActivity, resetWorkers }) => {
     };
   }, []);
 
-  // Debug output for unique worker tracking
+  // Worker detection and activity tracking
   useEffect(() => {
-    console.log("Current unique workers tracked:", Object.keys(detectedPeopleIds).length);
-  }, [detectedPeopleIds]);
-
-  // Clean up stale worker IDs periodically
-  useEffect(() => {
-    const cleanupInterval = setInterval(() => {
-      const currentTimestamp = Date.now();
-      const CLEANUP_THRESHOLD = 10000; // 10 seconds
-      
-      // Get timestamps of last detection for each worker
-      const activeWorkers = {};
-      workersStatus.forEach(status => {
-        activeWorkers[status.id] = new Date(status.timestamp).getTime();
-      });
-      
-      // Check if any workers haven't been seen for a while
-      Object.entries(detectedPeopleIds).forEach(([poseId, workerId]) => {
-        const lastSeen = activeWorkers[workerId] || 0;
-        if (currentTimestamp - lastSeen > CLEANUP_THRESHOLD) {
-          // This worker hasn't been seen recently, remove from tracking
-          setDetectedPeopleIds(prev => {
-            const updated = {...prev};
-            delete updated[poseId];
-            return updated;
-          });
-        }
-      });
-    }, 5000); // Run cleanup every 5 seconds
-    
-    return () => clearInterval(cleanupInterval);
-  }, [detectedPeopleIds, workersStatus]);
-
-  // Run pose detection
-  useEffect(() => {
-    if (!isModelLoaded) return;
+    if (!isModelLoaded || !videoRef.current) return;
     
     let animationFrameId = null;
     let lastDetectionTime = 0;
-    const DETECTION_INTERVAL = 2000; // 2 seconds between detection rounds (lowered from 5s)
-    // Store a reference to the video element
-    const videoElement = videoRef.current;
+    const DETECTION_INTERVAL = 500; // Half second between detections for better responsiveness
+    const MOVEMENT_THRESHOLD = 5; // Much lower threshold to detect subtle movements
+    const POSITION_MATCH_THRESHOLD = 80; // Maximum distance to consider the same person
+    const WORKER_TIMEOUT = 5000; // How long to keep tracking a worker after they disappear
     
-    // Helper function to calculate center position of a person
-    const getCenterPoint = (keypoints) => {
-      // We'll use the average of high-confidence keypoints
+    // Helper function to get the center position of a person from keypoints
+    const getPersonPosition = (keypoints) => {
+      // Focus on stable torso points
+      const torsoPoints = ['left_shoulder', 'right_shoulder', 'left_hip', 'right_hip'];
       let sumX = 0, sumY = 0, count = 0;
       
-      // Focus on torso keypoints for more stability
-      const torsoPoints = ['left_shoulder', 'right_shoulder', 'left_hip', 'right_hip'];
-      
-      for (const keypoint of keypoints) {
-        if (torsoPoints.includes(keypoint.name) && keypoint.score > 0.3) {
-          sumX += keypoint.x;
-          sumY += keypoint.y;
+      keypoints.forEach(point => {
+        if (torsoPoints.includes(point.name) && point.score > 0.3) {
+          sumX += point.x;
+          sumY += point.y;
           count++;
         }
-      }
+      });
       
       if (count === 0) return null;
-      
-      return {
-        x: sumX / count,
-        y: sumY / count
-      };
+      return { x: sumX / count, y: sumY / count };
     };
     
-    // Find matching person based on position proximity
-    const findMatchingPerson = (currentPos, lastPositions) => {
-      const MAX_DISTANCE = 100; // Maximum distance to consider the same person (in pixels)
+    // Match a detected person with existing tracked workers
+    const matchWorker = (position) => {
       let bestMatch = null;
-      let minDistance = MAX_DISTANCE;
+      let minDistance = POSITION_MATCH_THRESHOLD;
       
-      Object.entries(lastPositions).forEach(([id, pos]) => {
-        const dx = currentPos.x - pos.x;
-        const dy = currentPos.y - pos.y;
-        const distance = Math.sqrt(dx * dx + dy * dy);
+      Object.entries(workerTrackingRef.current).forEach(([workerId, data]) => {
+        if (!data.position) return;
+        
+        const dx = position.x - data.position.x;
+        const dy = position.y - data.position.y;
+        const distance = Math.sqrt(dx*dx + dy*dy);
         
         if (distance < minDistance) {
           minDistance = distance;
-          bestMatch = id;
+          bestMatch = workerId;
         }
       });
       
       return bestMatch;
     };
     
+    // Calculate movement between current and previous positions with enhanced sensitivity
+    const calculateMovement = (keypoints, previousKeypoints) => {
+      if (!previousKeypoints) return 10; // Default to some movement for new detections
+      
+      let totalMovement = 0;
+      let pointsChecked = 0;
+      
+      // Focus on hand, wrist and arm movements which are common in workplace tasks
+      const importantPoints = ['left_wrist', 'right_wrist', 'left_elbow', 'right_elbow', 'left_hand', 'right_hand'];
+      
+      // Check movement of high-confidence keypoints
+      keypoints.forEach((point, index) => {
+        // Give higher weight to hand/arm movements
+        const isImportantPoint = importantPoints.includes(point.name);
+        const weightMultiplier = isImportantPoint ? 2.0 : 1.0;
+        
+        // Lower confidence threshold for movement detection
+        if (point.score > 0.2 && previousKeypoints[index]?.score > 0.2) {
+          const dx = point.x - previousKeypoints[index].x;
+          const dy = point.y - previousKeypoints[index].y;
+          const pointMovement = Math.sqrt(dx*dx + dy*dy) * weightMultiplier;
+          totalMovement += pointMovement;
+          pointsChecked++;
+        }
+      });
+      
+      return pointsChecked > 0 ? totalMovement / pointsChecked : 0;
+    };
+    
     const detectPoses = async (timestamp) => {
-      if (!detectorRef.current || !videoElement || videoElement.readyState < 2) {
+      if (!detectorRef.current || !videoRef.current || videoRef.current.readyState < 2) {
         animationFrameId = requestAnimationFrame(detectPoses);
         return;
       }
 
-      // Only run detection at specified intervals
+      // Run detection at specified intervals
       if (timestamp - lastDetectionTime >= DETECTION_INTERVAL) {
         lastDetectionTime = timestamp;
         
         try {
-          // Multi-person pose estimation
-          const poses = await detectorRef.current.estimatePoses(videoElement, {
-            maxPoses: 5,
+          // Get all poses from the detector
+          const poses = await detectorRef.current.estimatePoses(videoRef.current, {
+            maxPoses: 10,  // Detect more poses to handle crowded scenes
             flipHorizontal: false
           });
           
-          const currentTimestamp = new Date().toISOString();
-          const newStatuses = [];
-          const currentPoseIds = new Set();
+          const currentTime = Date.now();
+          const detectedWorkerIds = new Set();
+          const activityUpdates = [];
           
-          // Track people using position and assign consistent worker IDs
+          // Process detected poses
           for (const pose of poses) {
-            const centerPoint = getCenterPoint(pose.keypoints);
-            // Only proceed if we have valid coordinates
-            if (!centerPoint) continue;
+            // Skip low confidence detections
+            if (pose.score < 0.25) continue;
             
-            // Find the closest matching previous position
-            const matchingId = findMatchingPerson(centerPoint, lastPositionsRef.current);
-            let personId;
+            const position = getPersonPosition(pose.keypoints);
+            if (!position) continue; // Skip if we can't establish a position
             
-            if (matchingId) {
-              // We found a match from previous detections
-              personId = matchingId;
-            } else {
-              // This appears to be a new person
-              personId = `worker_${nextPersonIdRef.current}`;
-              nextPersonIdRef.current += 1;
+            // Try to match with existing worker
+            let workerId = matchWorker(position);
+            let isNewWorker = false;
+            
+            if (!workerId) {
+              // Create new worker if no match found
+              workerId = `worker_${nextWorkerIdRef.current++}`;
+              isNewWorker = true;
+              
+              workerTrackingRef.current[workerId] = {
+                position: position,
+                lastSeen: currentTime,
+                previousKeypoints: null,
+                status: 'Active',  // New workers start as active
+                movementHistory: [30, 20, 15, 10, 8], // Start with assumed movement history
+                lastStatusChange: currentTime
+              };
             }
             
-            // Mark this pose ID as currently present
-            currentPoseIds.add(personId);
+            // Update this worker as seen
+            detectedWorkerIds.add(workerId);
+            const worker = workerTrackingRef.current[workerId];
             
-            // Update positions for this person
-            lastPositionsRef.current[personId] = centerPoint;
-
-            const keypoints = pose.keypoints;
+            // Calculate movement since last frame
+            const movement = calculateMovement(pose.keypoints, worker.previousKeypoints);
             
-            // Compute movement delta
-            let delta = 0;
-            const prev = lastKeypointsRef.current[personId];
+            // Update tracking data
+            worker.previousKeypoints = [...pose.keypoints];
+            worker.position = position;
+            worker.lastSeen = currentTime;
             
-            if (prev) {
-              for (let i = 0; i < keypoints.length; i++) {
-                if (keypoints[i].score > 0.3 && prev[i] && prev[i].score > 0.3) {
-                  const dx = keypoints[i].x - prev[i].x;
-                  const dy = keypoints[i].y - prev[i].y;
-                  delta += Math.sqrt(dx * dx + dy * dy);
-                }
-              }
+            // Update movement history with smoothing
+            worker.movementHistory.push(movement);
+            if (worker.movementHistory.length > 5) worker.movementHistory.shift(); // Use fewer frames for faster response
+            
+            // Use maximum recent movement instead of average to better detect short bursts of activity
+            const recentMax = Math.max(...worker.movementHistory);
+            const avgMovement = Math.max(
+              recentMax,
+              worker.movementHistory.reduce((sum, val) => sum + val, 0) / worker.movementHistory.length
+            );
+            
+            // Determine status based on average movement
+            const newStatus = avgMovement > MOVEMENT_THRESHOLD ? 'Active' : 'Idle';
+            
+            // More responsive status changes with shorter debounce time
+            const timeSinceStatusChange = currentTime - worker.lastStatusChange;
+            
+            // If status is changing from Idle to Active, respond quickly
+            // If changing from Active to Idle, require more consistent inactivity
+            const debounceTime = newStatus === 'Active' ? 500 : 3000;
+            
+            if (newStatus !== worker.status && 
+                (isNewWorker || timeSinceStatusChange > debounceTime)) {
+              worker.status = newStatus;
+              worker.lastStatusChange = currentTime;
+              
+              // Add to activity updates
+              activityUpdates.push({
+                id: workerId,
+                status: newStatus,
+                timestamp: new Date().toISOString()
+              });
             }
             
-            // Update reference keypoints
-            lastKeypointsRef.current[personId] = keypoints;
-            
-            // Determine status based on movement
-            const MOVEMENT_THRESHOLD = 15; // Adjust this value based on testing
-            const status = delta > MOVEMENT_THRESHOLD ? 'Active' : 'Idle';
-            
-            newStatuses.push({ id: personId, status, timestamp: currentTimestamp });
+            // Also send periodic updates even without status change (every 10 seconds)
+            else if (currentTime - worker.lastStatusChange > 10000) {
+              worker.lastStatusChange = currentTime;
+              
+              // Add status update with current status
+              activityUpdates.push({
+                id: workerId,
+                status: worker.status,
+                timestamp: new Date().toISOString()
+              });
+            }
           }
           
-          // Update the tracked IDs
-          setDetectedPeopleIds(prev => {
-            const updated = {};
-            Object.entries(prev).forEach(([poseId, workerId]) => {
-              // Keep only IDs that are still present
-              if (currentPoseIds.has(workerId)) {
-                updated[poseId] = workerId;
+          // Clean up workers who haven't been seen recently
+          Object.keys(workerTrackingRef.current).forEach(id => {
+            const worker = workerTrackingRef.current[id];
+            
+            // If this worker wasn't detected in this frame but still tracked
+            if (!detectedWorkerIds.has(id)) {
+              if (currentTime - worker.lastSeen > WORKER_TIMEOUT) {
+                // Worker has left, remove from tracking
+                delete workerTrackingRef.current[id];
               }
-            });
-            return updated;
+            }
           });
           
-          if (newStatuses.length > 0) {
-            setWorkersStatus(newStatuses);
-            onActivity(newStatuses);
+          // Update worker state for display
+          const currentWorkers = Object.entries(workerTrackingRef.current).map(([id, data]) => ({
+            id,
+            status: data.status,
+            lastSeen: new Date(data.lastSeen).toLocaleTimeString()
+          }));
+          
+          setWorkers(currentWorkers);
+          
+          // Send activity updates if any
+          if (activityUpdates.length > 0) {
+            onActivity(activityUpdates);
           }
         } catch (error) {
           console.error("Error during pose detection:", error);
@@ -296,56 +318,48 @@ const CameraFeed = ({ onActivity, resetWorkers }) => {
     // Start detection loop
     animationFrameId = requestAnimationFrame(detectPoses);
     
-    // Cleanup function
+    // Cleanup
     return () => {
       if (animationFrameId) {
         cancelAnimationFrame(animationFrameId);
-        console.log("Detection loop stopped");
       }
     };
   }, [isModelLoaded, onActivity]);
-
-  // Get unique workers by combining all current statuses
-  const uniqueWorkers = useMemo(() => {
-    const uniqueMap = {};
-    workersStatus.forEach((status) => {
-      uniqueMap[status.id] = status;
-    });
-    return Object.values(uniqueMap);
-  }, [workersStatus]);
 
   return (
     <div className="flex flex-col items-center">
       <div className="relative">
         <video
           ref={videoRef}
-          className="w-96 h-72 border-2 border-gray-300"
+          className="w-96 h-72 border-2 border-gray-300 rounded-lg"
           autoPlay
           playsInline
           muted
         />
         {!isModelLoaded && (
-          <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-50 text-white">
-            Loading pose detection model...
+          <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-50 text-white rounded-lg">
+            {cameraError || "Loading pose detection model..."}
           </div>
         )}
       </div>
       
       <div className="mt-2 text-sm text-gray-600">
-        <p>Current tracking: {uniqueWorkers.length} worker(s)</p>
+        <p>Currently tracking: {workers.length} worker(s)</p>
       </div>
       
-      <div className="mt-4 flex flex-wrap justify-center w-full">
-        {uniqueWorkers.map((w) => (
+      <div className="mt-4 flex flex-wrap justify-center gap-2 w-full">
+        {workers.map((worker) => (
           <div
-            key={w.id}
-            className={`m-2 p-3 rounded-lg border ${
-              w.status === 'Active' ? 'bg-green-300' : 'bg-red-300'
+            key={worker.id}
+            className={`p-3 rounded-lg border ${
+              worker.status === 'Active' 
+                ? 'bg-green-100 border-green-500 text-green-800' 
+                : 'bg-red-100 border-red-500 text-red-800'
             }`}
           >
-            <h3 className="text-lg font-semibold">{w.id}</h3>
-            <p>Status: {w.status}</p>
-            <p>{new Date(w.timestamp).toLocaleTimeString()}</p>
+            <h3 className="text-lg font-semibold">{worker.id}</h3>
+            <p>Status: {worker.status}</p>
+            <p className="text-xs">Last seen: {worker.lastSeen}</p>
           </div>
         ))}
       </div>
