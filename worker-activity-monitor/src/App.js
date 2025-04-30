@@ -1,40 +1,151 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import CameraFeed from './components/CameraFeed';
 import Analytics from './components/Analytics';
 import { saveAs } from 'file-saver';
-import './App.css';
 
 const App = () => {
   const [activityData, setActivityData] = useState([]);
+  const [uniqueWorkers, setUniqueWorkers] = useState({});
+  const [resetWorkersFlag, setResetWorkersFlag] = useState(false);
 
-  const handleActivity = (status) => {
-    const timestamp = new Date().toISOString();
-    setActivityData(prev => [...prev, { timestamp, status }]);
+  const [lastUpdateTime, setLastUpdateTime] = useState(null);
+  const [dataCollectionRate, setDataCollectionRate] = useState('5s');
+
+  // Handle new activity data from CameraFeed
+  const handleActivity = (statuses) => {
+    const now = Date.now();
+    
+    // Only update if we're allowing all data or enough time has passed since last update
+    if (!lastUpdateTime || (now - lastUpdateTime) > getDataCollectionInterval()) {
+      setLastUpdateTime(now);
+      
+      // Use throttling to limit how often we update the activity data
+      setActivityData((prev) => {
+        // Only keep track of a limited history to prevent the CSV from growing too large
+        const maxEntries = 1000; // Maximum number of entries to keep
+        
+        // Add new entries to the activity log with the current ones
+        const updatedData = [...prev, ...statuses];
+        
+        // If we're exceeding the max entries, trim the oldest ones
+        if (updatedData.length > maxEntries) {
+          return updatedData.slice(updatedData.length - maxEntries);
+        }
+        
+        return updatedData;
+      });
+    }
+  };
+  
+  // Convert the data collection rate to milliseconds
+  const getDataCollectionInterval = () => {
+    switch (dataCollectionRate) {
+      case '5s': return 5000;
+      case '10s': return 10000;
+      case '30s': return 30000;
+      case '1m': return 60000;
+      default: return 5000;
+    }
   };
 
+  // Update unique worker count whenever activity data changes
+  useEffect(() => {
+    // Create a set to track only unique worker IDs
+    const uniqueWorkerIds = new Set();
+    
+    // Only add each worker ID once
+    activityData.forEach(entry => {
+      uniqueWorkerIds.add(entry.id);
+    });
+    
+    // Convert set to object for consistent state handling
+    const workersObj = {};
+    uniqueWorkerIds.forEach(id => {
+      workersObj[id] = true;
+    });
+    
+    setUniqueWorkers(workersObj);
+  }, [activityData]);
+
+  // Generate and download CSV of activity data
   const downloadCSV = () => {
-    const headers = 'Timestamp,Status\n';
+    const headers = 'Worker ID,Timestamp,Status\n';
     const rows = activityData
-      .map(d => `${d.timestamp},${d.status}`)
+      .map((entry) => `${entry.id},${entry.timestamp},${entry.status}`)
       .join('\n');
-    const csv = headers + rows;
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
-    saveAs(blob, 'worker_activity.csv');
+    const blob = new Blob([headers + rows], { type: 'text/csv;charset=utf-8' });
+    
+    // Add date and time to filename
+    const now = new Date();
+    const dateStr = now.toISOString().split('T')[0];
+    const timeStr = now.toTimeString().split(' ')[0].replace(/:/g, '-');
+    
+    saveAs(blob, `worker_activity_${dateStr}_${timeStr}.csv`);
+  };
+  
+  // Clear all collected data and reset worker IDs
+  const clearData = () => {
+    if (window.confirm('Are you sure you want to clear all activity data?')) {
+      setActivityData([]);
+      setLastUpdateTime(null);
+      // Toggle reset workers flag to trigger reset in CameraFeed component
+      setResetWorkersFlag(prev => !prev);
+    }
   };
 
   return (
     <div className="min-h-screen bg-gray-100 flex flex-col items-center p-6">
       <h1 className="text-3xl font-bold mb-6">Worker Activity Monitor</h1>
-      <CameraFeed onActivity={handleActivity} />
-      <button
-        onClick={downloadCSV}
-        className="mt-4 px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
-      >
-        Download CSV
-      </button>
-      <div className="mt-8 w-full max-w-md">
-        <h2 className="text-2xl font-semibold mb-4">Analytics</h2>
-        <Analytics data={activityData} />
+      
+      <div className="bg-white p-4 rounded-lg shadow-md mb-6 w-full max-w-2xl">
+        <div className="mb-2 text-gray-700">
+          <span className="font-semibold">Workers detected:</span> {Object.keys(uniqueWorkers).length}
+        </div>
+        <div className="mb-2 text-gray-700">
+          <span className="font-semibold">Activity logs recorded:</span> {activityData.length}
+        </div>
+        <div className="mb-4 flex items-center">
+          <span className="font-semibold mr-2">Data collection rate:</span>
+          <select
+            value={dataCollectionRate}
+            onChange={(e) => setDataCollectionRate(e.target.value)}
+            className="border rounded px-2 py-1"
+          >
+            <option value="5s">Every 5 seconds</option>
+            <option value="10s">Every 10 seconds</option>
+            <option value="30s">Every 30 seconds</option>
+            <option value="1m">Every minute</option>
+          </select>
+          <span className="ml-4 text-xs text-gray-500">Last updated: {lastUpdateTime ? new Date(lastUpdateTime).toLocaleTimeString() : 'Never'}</span>
+        </div>
+        <CameraFeed onActivity={handleActivity} resetWorkers={resetWorkersFlag} />
+      </div>
+
+      <div className="flex space-x-4">
+        <button
+          onClick={downloadCSV}
+          className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 shadow-md"
+          disabled={activityData.length === 0}
+        >
+          Download Activity Data (CSV)
+        </button>
+        
+        <button
+          onClick={clearData}
+          className="px-4 py-2 bg-red-500 text-white rounded hover:bg-red-600 shadow-md"
+          disabled={activityData.length === 0}
+        >
+          Clear Data
+        </button>
+      </div>
+
+      <div className="mt-8 w-full max-w-3xl bg-white p-6 rounded-lg shadow-md">
+        <h2 className="text-2xl font-semibold mb-4">Activity Analytics</h2>
+        {activityData.length > 0 ? (
+          <Analytics data={activityData} />
+        ) : (
+          <p className="text-gray-500 italic">No activity data recorded yet</p>
+        )}
       </div>
     </div>
   );
